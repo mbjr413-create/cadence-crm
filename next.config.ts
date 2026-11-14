@@ -1,19 +1,7 @@
-﻿import type { NextConfig } from "next";
+import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  webpack: (config) => {
-    config.watchOptions = {
-      ...config.watchOptions,
-      ignored: [
-        "**/node_modules/**",
-        "**/prisma/dev.db*",
-        "**/*.db",
-        "**/*.db-journal",
-        "**/*.db-wal",
-      ],
-    };
-    return config;
-  },
+  // Config is now clean. Turso handles the DB, so we don't need to ignore local files anymore.
 };
 
 export default nextConfig;
