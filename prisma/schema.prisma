@@ -1,0 +1,65 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Website {
+  id              String   @id @default(cuid())
+  domain          String   @unique
+  url             String
+  email           String?
+  status          String   @default("NEW")
+  progressMessage String?
+  price           String?
+  createdAt       DateTime @default(now())
+  emails          Email[]
+}
+
+model Email {
+  id             String   @id @default(cuid())
+  subject        String
+  body           String
+  pixelId        String   @unique @default(cuid())
+  isOpened       Boolean  @default(false)
+  openedAt       DateTime?
+  sentAt         DateTime @default(now())
+  followUpCount  Int      @default(0)
+  websiteId      String
+  website        Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  replies        Reply[]
+}
+
+model Reply {
+  id          String   @id @default(cuid())
+  body        String
+  receivedAt  DateTime @default(now())
+  isFromUs    Boolean  @default(false)
+  isRead      Boolean  @default(false) 
+  attachments String?
+  emailId     String
+  email       Email    @relation(fields: [emailId], references: [id], onDelete: Cascade)
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
+model Template {
+  id        String   @id @default(cuid())
+  name      String
+  subject   String
+  body      String
+  createdAt DateTime @default(now())
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  message   String
+  type      String   // 'success' or 'error'
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
