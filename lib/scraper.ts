@@ -108,7 +108,17 @@ export async function extractEmailsFromSite(baseUrl: string, onProgress: (msg: s
     }
   };
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = process.env.VERCEL
+    ? await (async () => {
+        // Use Chromium packaged for Linux serverless runtimes.
+        const serverlessChromium = (await import("@sparticuz/chromium")).default;
+        return chromium.launch({
+          executablePath: await serverlessChromium.executablePath(),
+          args: serverlessChromium.args,
+          headless: true,
+        });
+      })()
+    : await chromium.launch({ headless: true });
   const context = await browser.newContext({
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   });
