@@ -20,10 +20,27 @@ export async function POST(request: Request) {
   }
 
   try {
+    // Cron has an empty POST body; manual requests can prioritize selected IDs.
+    let requestedIds: string[] | undefined;
+    try {
+      const payload = await request.json();
+      if (payload && typeof payload === "object" && "websiteIds" in payload) {
+        const ids = payload.websiteIds;
+        if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100 ||
+            !ids.every((id: unknown) => typeof id === "string" && id.length > 0 && id.length <= 200)) {
+          return NextResponse.json({ error: "Invalid websiteIds" }, { status: 400 });
+        }
+        requestedIds = ids as string[];
+      }
+    } catch {
+      // An empty POST body is expected for cron-job.org.
+    }
+
     // Protect against overlapping cron invocations by atomically claiming one queued record.
     const candidates = await prisma.website.findMany({
       where: {
         status: "PROCESSING",
+        ...(requestedIds ? { id: { in: requestedIds } } : {}),
         progressMessage: { in: ["Queued...", "Queued for scraping...", "Starting..."] },
       },
       select: { id: true, progressMessage: true },
@@ -36,6 +53,7 @@ export async function POST(request: Request) {
         where: {
           id: candidate.id,
           status: "PROCESSING",
+        ...(requestedIds ? { id: { in: requestedIds } } : {}),
           progressMessage: candidate.progressMessage,
         },
         data: { progressMessage: "Starting scrape..." },

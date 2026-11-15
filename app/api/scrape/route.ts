@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
+import { scheduleImmediateScraperRun } from "@/lib/scrape-trigger";
+export const maxDuration = 180;
+
+export const runtime = "nodejs";
 import { prisma } from "@/lib/prisma";
-import Anthropic from "@anthropic-ai/sdk";
-import { extractEmailsFromSite } from "@/lib/scraper";
-import { getAnthropicKey } from "@/lib/settings";
 
 export async function POST(req: Request) {
   try {
@@ -14,59 +15,9 @@ export async function POST(req: Request) {
       data: { status: "PROCESSING", progressMessage: "Queued for scraping..." }
     });
 
-    processSites(websiteIds).catch(console.error);
+    scheduleImmediateScraperRun(websiteIds);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json({ error: "Failed to start" }, { status: 500 });
-  }
-}
-
-async function processSites(ids: string[]) {
-  const sites = await prisma.website.findMany({ where: { id: { in: ids } } });
-  const apiKey = await getAnthropicKey();
-  const anthropic = new Anthropic({ apiKey });
-
-  for (const site of sites) {
-    const liveSite = await prisma.website.findUnique({ where: { id: site.id } });
-    if (liveSite?.status !== "PROCESSING") continue;
-
-    const updateProgress = async (msg: string) => {
-      await prisma.website.update({ where: { id: site.id }, data: { progressMessage: msg } });
-    };
-
-    const foundEmails = await extractEmailsFromSite(site.url, updateProgress);
-    let bestEmail = null;
-
-    if (foundEmails.length > 0) {
-      if (foundEmails.length === 1) {
-        bestEmail = foundEmails[0];
-      } else {
-        await updateProgress("AI analyzing contacts...");
-        try {
-          const msg = await anthropic.messages.create({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 50,
-            system: "You are an expert data cleaner. Analyze this list of emails found on a website. 1. Discard obvious placeholders like 'you@company.com', 'user@domain.com', or anything containing 'example'. 2. Discard random strings or code. 3. If there is a real contact email (e.g., hello@site.com, editor@site.com), reply with that exact email. 4. If ALL emails are placeholders or junk, reply EXACTLY with the word 'NONE'. Do not include any other text.",
-            messages: [{ role: "user", content: `Emails: ${foundEmails.join(", ")}` }]
-          });
-          const aiPick = (msg.content[0] as any).text.trim();
-          
-          if (aiPick !== "NONE") {
-             bestEmail = foundEmails.includes(aiPick) ? aiPick : foundEmails[0];
-          }
-        } catch (e) {
-          bestEmail = foundEmails[0];
-        }
-      }
-    }
-
-    await prisma.website.update({
-      where: { id: site.id },
-      data: {
-        email: bestEmail, 
-        status: bestEmail ? "EMAIL_FOUND" : "NO_EMAIL",
-        progressMessage: bestEmail ? "Done!" : "No email found."
-      }
-    });
   }
 }
