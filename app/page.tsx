@@ -88,7 +88,17 @@ export default function Dashboard() {
   const [progressStats, setProgressStats] = useState({ total: 0, done: 0, found: 0 });
   const [currentAction, setCurrentAction] = useState("");
   const [batchIds, setBatchIds] = useState<string[]>([]);
-  const [isStopped, setIsStopped] = useState(false);
+  const [isStopped, setIsStopped] = useState(true);
+  const browserScrapeRunningRef = useRef(false);
+  const browserScrapeStopRef = useRef(false);
+  const [scrapeReport,setScrapeReport] = useState<any|null>(null);
+  useEffect(() => {
+    const handler=(e:BeforeUnloadEvent)=>{
+      if(browserScrapeRunningRef.current){ e.preventDefault();e.returnValue=''; }
+    };
+    window.addEventListener('beforeunload',handler);
+    return ()=>window.removeEventListener('beforeunload',handler);
+  },[]);
 
   // --- TOAST STATE ---
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
@@ -128,7 +138,7 @@ export default function Dashboard() {
     if (aiChats.length > 0) localStorage.setItem("cadence_ai_chats", JSON.stringify(aiChats));
   }, [aiChats]);
 
-  const displaySites = sites.filter(s => s.status !== 'PROCESSING');
+  const displaySites = sites;
   const isAllSelected = displaySites.length > 0 && displaySites.every(s => selectedSites.includes(s.id));
 
   const unreadSystemCount = systemNotifications.filter(n => !n.isRead).length;
@@ -307,7 +317,7 @@ export default function Dashboard() {
         if (batchIds.length > 0) {
           const trackingSites = updated.filter((s: any) => batchIds.includes(s.id));
           const processingSites = trackingSites.filter((s: any) => s.status === 'PROCESSING');
-          const doneSites = trackingSites.filter((s: any) => s.status === 'EMAIL_FOUND' || s.status === 'NO_EMAIL');
+          const doneSites = trackingSites.filter((s: any) => ['EMAIL_FOUND','NO_EMAIL','FAILED'].includes(s.status));
           const foundSites = trackingSites.filter((s: any) => s.status === 'EMAIL_FOUND');
 
           const activeSite = processingSites.find((s: any) => s.progressMessage && s.progressMessage !== 'Queued...' && s.progressMessage !== 'Starting...' && s.progressMessage !== 'Queued for scraping...');
@@ -537,18 +547,77 @@ export default function Dashboard() {
   const onFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => { if (e.target.files && e.target.files[0]) processFile(e.target.files[0]); if (fileInputRef.current) fileInputRef.current.value = ""; };
   const cancelUpload = () => { setPendingFile(null); setFileStats(null); };
 
-  const startScrapeFromFile = async () => {
-    if (!pendingFile) return;
-    setIsUploading(true);
-    const formData = new FormData(); formData.append("file", pendingFile);
+  // The OPEN BROWSER TAB drives the scraper. There is no cron or detached worker.
+  const executeScrapeInOpenTab = async (ids: string[], queueFirst: boolean) => {
+    if(browserScrapeRunningRef.current) {showToast('A scrape is already running','error');return;}
+    const uniqueIds=[...new Set(ids)].filter(Boolean);
+    if(!uniqueIds.length)return;
+    browserScrapeRunningRef.current=true;
+    browserScrapeStopRef.current=false;
+    setScrapePrompt(null);setBatchIds(uniqueIds);setIsStopped(false);setShowProgress(true);
+    setProgressStats({total:uniqueIds.length,done:0,found:0});
+    setCurrentAction('Scraping started. Keep this browser tab open until completion.');
     try {
-      const res = await fetch("/api/upload", { method: "POST", body: formData });
-      const data = await res.json();
-      if (data.success) {
-        cancelUpload(); setBatchIds(data.ids); setShowProgress(true); setIsStopped(false);
-        setProgressStats({ total: data.total, done: 0, found: 0 }); setCurrentAction("Starting batch of " + data.total + " websites..."); fetchSites();
-      } else showToast(data.error || "Upload failed", "error");
-    } catch (error) { showToast("Failed to upload CSV", "error"); } finally { setIsUploading(false); }
+      if(queueFirst){
+        const response=await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({websiteIds:uniqueIds})});
+        const json=await response.json().catch(()=>({}));
+        if(!response.ok)throw Error(json.error||'Could not queue websites');
+      }
+      let done=0,found=0,failed=0;
+      for(const id of uniqueIds){
+        if(browserScrapeStopRef.current)break;
+        setCurrentAction('Scraping website '+(done+1)+' of '+uniqueIds.length+'. Do not close this tab.');
+        const response=await fetch('/api/scrape/run',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({websiteId:id}),cache:'no-store'
+        });
+        const result=await response.json().catch(()=>({}));
+        if(!response.ok)throw Error(result.error||('Scraper returned HTTP '+response.status));
+        if(browserScrapeStopRef.current)break;
+        if(result.status==='SKIPPED')throw Error('This website was paused or requeued');
+        done++;
+        if(result.status==='EMAIL_FOUND')found++;
+        if(result.status==='FAILED')failed++;
+        setProgressStats({total:uniqueIds.length,done,found});
+        setCurrentAction('Processed '+done+'/'+uniqueIds.length+' websites; '+found+' emails found, '+failed+' failed.');
+        await fetchSites();
+      }
+      if(!browserScrapeStopRef.current){
+        setCurrentAction('Finished. '+found+' emails found. '+failed+' website(s) failed.');
+        if(failed)showToast(failed+' website(s) failed. See individual reports.','error');
+      }
+    }catch(error){
+      const message=error instanceof Error?error.message:'Unknown error';
+      console.error('[browser scraper]',error);
+      setIsStopped(true);browserScrapeStopRef.current=true;
+      setCurrentAction('Paused: '+message+'. Click Resume to continue.');
+      showToast(message,'error');
+    }finally{
+      browserScrapeRunningRef.current=false;
+      await fetchSites();
+    }
+  };
+  const viewScrapeReport=async(id:string)=>{
+    try {
+      const response=await fetch('/api/scrape/diagnostics?websiteId='+encodeURIComponent(id));
+      const data=await response.json();
+      if(!response.ok)throw Error(data.error||'Failed to read report');
+      setScrapeReport(data);
+    }catch(error){showToast(error instanceof Error?error.message:'Unable to load report','error');}
+  };
+
+  const startScrapeFromFile = async () => {
+    if(!pendingFile||browserScrapeRunningRef.current)return;
+    setIsUploading(true);
+    const formData=new FormData();formData.append('file',pendingFile);
+    try{
+      const response=await fetch('/api/upload',{method:'POST',body:formData});
+      const result=await response.json();
+      if(!response.ok||!result.success){showToast(result.error||'CSV upload failed','error');return;}
+      cancelUpload();await fetchSites();
+      void executeScrapeInOpenTab(result.ids,false);
+    }catch(error){console.error(error);showToast('CSV upload failed','error');}
+    finally{setIsUploading(false);}
   };
 
   const handleManualAdd = async (e: React.FormEvent) => {
@@ -567,24 +636,34 @@ export default function Dashboard() {
   };
 
   const runScrape = async (ids: string[]) => {
-    setScrapePrompt(null); setBatchIds(ids); setIsStopped(false);
-    setSites(prev => prev.map(s => ids.includes(s.id) ? { ...s, status: 'PROCESSING', progressMessage: 'Starting...' } : s));
-    setShowProgress(true); setProgressStats({ total: ids.length, done: 0, found: 0 }); setCurrentAction("Starting scrape for " + ids.length + " websites...");
-    await fetch("/api/scrape", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ websiteIds: ids }) });
+    if(browserScrapeRunningRef.current){showToast('Scraper already running','error');return;}
+    void executeScrapeInOpenTab(ids,true);
   };
 
   const stopScrape = async () => {
-    setIsStopped(true); setCurrentAction("Stopping... please wait.");
-    await fetch("/api/scrape/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ websiteIds: batchIds }) });
-    fetchSites(); setCurrentAction("Scraping paused by user.");
+    browserScrapeStopRef.current=true;setIsStopped(true);
+    setCurrentAction('Stopping current website request...');
+    try {
+      const response=await fetch('/api/scrape/stop',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({websiteIds:batchIds})
+      });
+      if(!response.ok)throw Error('Unable to pause websites');
+      setCurrentAction('Paused. Wait for the current request to finish before resuming.');
+      await fetchSites();
+    }catch(error){console.error(error);showToast('Could not pause scraper','error');}
   };
 
   const resumeScrape = async () => {
-    const remainingIds = sites.filter(s => batchIds.includes(s.id) && s.status === 'NEW').map(s => s.id);
-    if (remainingIds.length === 0) { setIsStopped(false); return; }
-    setIsStopped(false); setCurrentAction("Resuming scrape...");
-    setSites(prev => prev.map(s => remainingIds.includes(s.id) ? { ...s, status: 'PROCESSING', progressMessage: 'Starting...' } : s));
-    await fetch("/api/scrape", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ websiteIds: remainingIds }) });
+    if(browserScrapeRunningRef.current){
+      showToast('Current website still finishing; try Resume again shortly','error');return;
+    }
+    const latest=await fetchSites();
+    const remainingIds=batchIds.filter(id=>{
+      const site=latest.find((s:any)=>s.id===id);
+      return site&&!['EMAIL_FOUND','NO_EMAIL'].includes(site.status);
+    });
+    if(!remainingIds.length){setIsStopped(false);return;}
+    void executeScrapeInOpenTab(remainingIds,true);
   };
 
   const confirmDelete = async () => {
@@ -832,7 +911,7 @@ export default function Dashboard() {
                         <td><span className={"tag " + (site.status === 'EMAIL_FOUND' ? 'tag-green' : site.status === 'SENT' ? 'tag-blue' : site.status === 'REPLIED' ? 'tag-purple' : site.status === 'NO_EMAIL' ? 'tag-red' : 'tag-gray')}>{site.status.replace('_', ' ')}</span></td>
                         <td style={{ color: 'var(--text-muted)' }}>{new Date(site.createdAt).toLocaleDateString()}</td>
                         <td style={{ textAlign: 'right' }}><div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-                          <button onClick={() => initiateScrape([site.id])} title="Run Scraper" style={{ color: '#3B82F6' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></button>
+                          <button onClick={() => initiateScrape([site.id])} title="Run Scraper" style={{ color: '#3B82F6' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></button><button onClick={() => viewScrapeReport(site.id)} title="View scrape report" style={{fontSize:"11px",color:"#64748B"}}>Report</button>
                           <button onClick={() => setEditingSite(site)} title="Edit" style={{ color: 'var(--text-muted)' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
                           <button onClick={() => setDeletingSite(site)} title="Delete" style={{ color: '#EF4444' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
                         </div></td>
@@ -990,10 +1069,10 @@ export default function Dashboard() {
                   <>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '20px' }}><h3 style={{ fontSize: '20px', fontWeight: 600 }}>{isStopped ? "Scraping Paused" : isFinished ? "Scraping Complete" : "Scraping in Progress..."}</h3><span style={{ fontSize: '28px', fontWeight: 800, color: '#111' }}>{progressPercent}%</span></div>
                     <div style={{ width: '100%', height: '12px', background: '#E5E7EB', borderRadius: '10px', overflow: 'hidden', marginBottom: '16px' }}><div style={{ height: '100%', width: progressPercent + "%", background: isStopped ? '#EF4444' : '#84CC16', borderRadius: '10px', transition: 'width 0.8s cubic-bezier(0.4, 0, 0.2, 1)' }} /></div>
-                    <div style={{ height: '24px', marginBottom: '32px', fontSize: '14px', color: '#6B7280', fontWeight: 500 }}>{isStopped ? "Paused by user. You can resume this batch anytime." : !isFinished ? currentAction : "All tasks completed successfully."}</div>
+                    <div style={{ height: '24px', marginBottom: '32px', fontSize: '14px', color: '#6B7280', fontWeight: 500 }}>{isStopped ? "Paused by user. You can resume this batch anytime." : !isFinished ? currentAction : (sites.some(s=>batchIds.includes(s.id)&&s.status==="FAILED")?"Finished with failures — inspect website reports.":"All websites processed.")}</div>
                     <div style={{ display: 'flex', gap: '32px', fontSize: '15px', color: '#4B5563', marginBottom: '32px', borderTop: '1px solid #E5E7EB', paddingTop: '24px' }}>
                       {isSingleSite ? (
-                        <div style={{ fontWeight: 500 }}>{isFinished ? (singleSite?.email ? <span style={{ color: '#166534', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px' }}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6L9 17l-5-5"/></svg> Email Found: {singleSite.email}</span> : <span style={{ color: '#EF4444', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px' }}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg> No Email Found</span>) : <span style={{ color: '#6B7280' }}>Searching for contact email...</span>}</div>
+                        <div style={{ fontWeight: 500 }}>{isFinished ? (singleSite?.status === "FAILED" ? <span style={{color:"#B91C1C"}}>Scrape failed: {singleSite.progressMessage}</span> : singleSite?.email ? <span style={{ color: '#166534', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px' }}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6L9 17l-5-5"/></svg> Email Found: {singleSite.email}</span> : <span style={{ color: '#EF4444', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px' }}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg> No Email Found</span>) : <span style={{ color: '#6B7280' }}>Searching for contact email...</span>}</div>
                       ) : (
                         <><div><strong style={{ color: '#111', fontSize: '20px' }}>{progressStats.total}</strong> <br/>Total Sites</div><div><strong style={{ color: '#111', fontSize: '20px' }}>{progressStats.done}</strong> <br/>Scraped</div><div style={{ color: '#166534' }}><strong style={{ fontSize: '20px' }}>{progressStats.found}</strong> <br/>Emails Found</div></>
                       )}
@@ -1004,7 +1083,7 @@ export default function Dashboard() {
                       ) : isFinished ? (
                         <button className="btn-black" style={{ width: '100%', justifyContent: 'center', background: '#000', color: '#FFF', padding: '14px', fontSize: '14px', cursor: 'pointer' }} onClick={() => { setBatchIds([]); setActiveTab('websites'); }}>View Results</button>
                       ) : (
-                        <><button onClick={stopScrape} style={{ flex: 1, padding: '14px', fontSize: '14px', fontWeight: 600, background: '#FEF2F2', color: '#EF4444', border: '1px solid #FECACA', borderRadius: '6px', transition: 'all 0.2s', cursor: 'pointer' }}>Stop Scraping</button><button className="btn-black" style={{ flex: 2, justifyContent: 'center', background: '#F3F4F6', color: '#9CA3AF', cursor: 'not-allowed', padding: '14px', fontSize: '14px' }} disabled>Running in background...</button></>
+                        <><button onClick={stopScrape} style={{ flex: 1, padding: '14px', fontSize: '14px', fontWeight: 600, background: '#FEF2F2', color: '#EF4444', border: '1px solid #FECACA', borderRadius: '6px', transition: 'all 0.2s', cursor: 'pointer' }}>Stop Scraping</button><button className="btn-black" style={{ flex: 2, justifyContent: 'center', background: '#F3F4F6', color: '#9CA3AF', cursor: 'not-allowed', padding: '14px', fontSize: '14px' }} disabled>Keep this tab open (required)</button></>
                       )}
                     </div>
                   </>
@@ -1317,10 +1396,10 @@ export default function Dashboard() {
             <button onClick={() => setShowProgress(false)} style={{ position: 'absolute', top: '20px', right: '20px', background: 'transparent', border: 'none', cursor: 'pointer', color: '#9CA3AF', padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '20px' }}><h2 style={{ fontSize: '22px', fontWeight: 700 }}>{isStopped ? "Scraping Paused" : isFinished ? "Scraping Complete" : "Scraping in Progress..."}</h2><span style={{ fontSize: '24px', fontWeight: 800, color: '#111', paddingRight: '30px' }}>{progressPercent}%</span></div>
             <div style={{ width: '100%', height: '8px', background: '#E5E7EB', borderRadius: '10px', overflow: 'hidden', marginBottom: '12px' }}><div style={{ height: '100%', width: progressPercent + "%", background: isStopped ? '#EF4444' : '#84CC16', borderRadius: '10px', transition: 'width 0.8s cubic-bezier(0.4, 0, 0.2, 1)' }} /></div>
-            <div style={{ height: '20px', marginBottom: '24px', fontSize: '13px', color: '#6B7280', textAlign: 'left', fontWeight: 500 }}>{isStopped ? "Paused by user. You can resume this batch anytime." : !isFinished ? currentAction : "All tasks completed successfully."}</div>
+            <div style={{ height: '20px', marginBottom: '24px', fontSize: '13px', color: '#6B7280', textAlign: 'left', fontWeight: 500 }}>{isStopped ? "Paused by user. You can resume this batch anytime." : !isFinished ? currentAction : (sites.some(s=>batchIds.includes(s.id)&&s.status==="FAILED")?"Finished with failures — inspect website reports.":"All websites processed.")}</div>
             <div style={{ display: 'flex', gap: '24px', fontSize: '13px', color: '#4B5563', marginBottom: '32px', borderTop: '1px solid #E5E7EB', paddingTop: '20px' }}>
               {isSingleSite ? (
-                <div style={{ fontWeight: 500 }}>{isFinished ? (singleSite?.email ? <span style={{ color: '#166534', display: 'flex', alignItems: 'center', gap: '6px' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6L9 17l-5-5"/></svg> Email Found: {singleSite.email}</span> : <span style={{ color: '#EF4444', display: 'flex', alignItems: 'center', gap: '6px' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg> No Email Found</span>) : <span style={{ color: '#6B7280' }}>Searching for contact email...</span>}</div>
+                <div style={{ fontWeight: 500 }}>{isFinished ? (singleSite?.status === "FAILED" ? <span style={{color:"#B91C1C"}}>Scrape failed: {singleSite.progressMessage}</span> : singleSite?.email ? <span style={{ color: '#166534', display: 'flex', alignItems: 'center', gap: '6px' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6L9 17l-5-5"/></svg> Email Found: {singleSite.email}</span> : <span style={{ color: '#EF4444', display: 'flex', alignItems: 'center', gap: '6px' }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg> No Email Found</span>) : <span style={{ color: '#6B7280' }}>Searching for contact email...</span>}</div>
               ) : (
                 <><div><strong style={{ color: '#111' }}>{progressStats.total}</strong> Total Sites</div><div><strong style={{ color: '#111' }}>{progressStats.done}</strong> Scraped</div><div style={{ color: '#166534' }}><strong>{progressStats.found}</strong> Emails Found</div></>
               )}
@@ -1331,9 +1410,23 @@ export default function Dashboard() {
               ) : isFinished ? (
                 <button className="btn-black" style={{ width: '100%', justifyContent: 'center', background: '#000', color: '#FFF', padding: '14px', fontSize: '14px' }} onClick={() => { setShowProgress(false); setBatchIds([]); setActiveTab('websites'); }}>View Results</button>
               ) : (
-                <><button onClick={stopScrape} style={{ flex: 1, padding: '14px', fontSize: '14px', fontWeight: 600, background: '#FEF2F2', color: '#EF4444', border: '1px solid #FECACA', borderRadius: '6px', transition: 'all 0.2s' }}>Stop Scraping</button><button onClick={() => setShowProgress(false)} className="btn-black" style={{ flex: 1, justifyContent: 'center', background: '#111', color: '#FFF', padding: '14px', fontSize: '14px' }}>Run in Background</button></>
+                <><button onClick={stopScrape} style={{ flex: 1, padding: '14px', fontSize: '14px', fontWeight: 600, background: '#FEF2F2', color: '#EF4444', border: '1px solid #FECACA', borderRadius: '6px', transition: 'all 0.2s' }}>Stop Scraping</button><button onClick={() => setShowProgress(false)} className="btn-black" style={{ flex: 1, justifyContent: 'center', background: '#111', color: '#FFF', padding: '14px', fontSize: '14px' }}>Keep this tab open (required)</button></>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {scrapeReport && (
+        <div style={{position:'fixed',inset:0,zIndex:350,background:'rgba(0,0,0,0.5)',display:'grid',placeItems:'center'}}>
+          <div className="card" style={{background:'#fff',padding:'24px',width:'min(750px,94vw)',maxHeight:'85vh',overflow:'auto'}}>
+            <div style={{display:'flex',justifyContent:'space-between',gap:'16px'}}>
+              <strong>Scraper report — {scrapeReport.site?.domain}</strong>
+              <button onClick={() => setScrapeReport(null)}>Close</button>
+            </div>
+            {scrapeReport.diagnostic
+              ? <pre style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere',fontSize:'12px',padding:'16px',background:'#F8FAFC',marginTop:'16px'}}>{JSON.stringify(scrapeReport.diagnostic,null,2)}</pre>
+              : <p style={{marginTop:'16px'}}>No report saved yet. Run a scrape to generate one.</p>}
           </div>
         </div>
       )}

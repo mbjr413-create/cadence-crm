@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { scheduleImmediateScraperRun } from "@/lib/scrape-trigger";
 export const maxDuration = 180;
 
 export const runtime = "nodejs";
@@ -38,8 +37,6 @@ export async function POST(req: Request) {
     }
 
     if (newIds.length === 0) return NextResponse.json({ error: "All domains already exist" }, { status: 400 });
-
-    scheduleImmediateScraperRun(newIds);
     return NextResponse.json({ success: true, total: newIds.length, ids: newIds });
   } catch (error) {
     return NextResponse.json({ error: "Failed to process" }, { status: 500 });
