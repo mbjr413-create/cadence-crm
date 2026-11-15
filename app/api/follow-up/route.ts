@@ -44,7 +44,7 @@ export async function POST() {
     });
 
     if (emailsToFollowUp.length === 0) {
-      return NextResponse.json({ error: "No emails eligible for follow-up right now." }, { status: 400 });
+      return NextResponse.json({ success: true, count: 0, message: "No emails eligible for follow-up right now." });
     }
 
     const credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
