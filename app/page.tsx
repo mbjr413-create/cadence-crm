@@ -321,8 +321,8 @@ export default function Dashboard() {
           const foundSites = trackingSites.filter((s: any) => s.status === 'EMAIL_FOUND');
 
           const activeSite = processingSites.find((s: any) => s.progressMessage && s.progressMessage !== 'Queued...' && s.progressMessage !== 'Starting...' && s.progressMessage !== 'Queued for scraping...');
-          if (activeSite) setCurrentAction("Scraping " + activeSite.domain + ": " + activeSite.progressMessage);
-          else if (processingSites.length > 0) setCurrentAction("Scraping " + processingSites[0].domain + ": " + processingSites[0].progressMessage);
+          if (activeSite) setCurrentAction("Scraping " + activeSite.domain + ": " + String(activeSite.progressMessage).replace(/^TAB:[^|]*\|/, ""));
+          else if (processingSites.length > 0) setCurrentAction("Scraping " + processingSites[0].domain + ": " + String(processingSites[0].progressMessage).replace(/^TAB:[^|]*\|/, ""));
           else if (doneSites.length > 0) setCurrentAction("Finalizing...");
 
           setProgressStats({ total: batchIds.length, done: doneSites.length, found: foundSites.length });
